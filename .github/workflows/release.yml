@@ -8,6 +8,10 @@ on:
         required: true
         type: string
   push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/release.yml'
     tags:
       - 'v*'
 
@@ -59,7 +63,13 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $tag = if ($env:EVENT_NAME -eq 'workflow_dispatch') { $env:RELEASE_TAG } else { $env:GITHUB_REF_NAME }
+          if ($env:EVENT_NAME -eq 'workflow_dispatch') {
+            $tag = $env:RELEASE_TAG
+          } elseif ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tag = $env:GITHUB_REF_NAME
+          } else {
+            $tag = 'v0.1.0'
+          }
           if ($tag -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "Invalid release tag: $tag" }
           if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw 'GitHub CLI is not installed on the runner.' }
           @'
