@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag (for example v0.1.0)
+        description: Release tag (for example v0.1.1)
         required: true
         type: string
   push:
@@ -12,6 +12,8 @@ on:
       - main
     paths:
       - '.github/workflows/release.yml'
+      - 'src/**'
+      - 'tests/**'
     tags:
       - 'v*'
 
@@ -25,7 +27,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Build and verify x64 executable
+      - name: Locate Visual Studio and Windows SDK
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -34,14 +36,12 @@ jobs:
           if (-not (Test-Path $vswhere)) { throw "Visual Studio locator not found: $vswhere" }
           $install = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $install) { throw 'Visual Studio C++ x64 toolchain not found.' }
-
           $msvcRoot = Join-Path $install 'VC\Tools\MSVC'
           $msvc = Get-ChildItem -LiteralPath $msvcRoot -Directory | Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
           if (-not $msvc) { throw "MSVC compiler not found under $msvcRoot" }
           $compilerBin = Join-Path $msvc.FullName 'bin\Hostx64\x64'
           $compiler = Join-Path $compilerBin 'cl.exe'
           if (-not (Test-Path $compiler)) { throw "x64 compiler not found: $compiler" }
-
           $kitsRoot = Join-Path $programFilesX86 'Windows Kits\10'
           $kitVersion = Get-ChildItem -LiteralPath (Join-Path $kitsRoot 'Include') -Directory | Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
           if (-not $kitVersion) { throw "Windows SDK headers not found under $kitsRoot" }
@@ -50,13 +50,40 @@ jobs:
           $env:INCLUDE = (@((Join-Path $msvc.FullName 'include'), (Join-Path $sdkInclude 'ucrt'), (Join-Path $sdkInclude 'um'), (Join-Path $sdkInclude 'shared'), (Join-Path $sdkInclude 'winrt')) -join ';')
           $env:LIB = (@((Join-Path $msvc.FullName 'lib\x64'), (Join-Path $sdkLib 'ucrt\x64'), (Join-Path $sdkLib 'um\x64')) -join ';')
           $env:PATH = "$compilerBin;$env:PATH"
-
+          "NARAKA_MSVC=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "INCLUDE=$env:INCLUDE" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LIB=$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $compilerBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Write-Host "MSVC: $compiler"
+          Write-Host "Windows SDK: $($kitVersion.Name)"
+
+      - name: Test single and split voice package discovery
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:NARAKA_MSVC /nologo /EHsc /std:c++17 /utf-8 /W3 /I src tests\voice_files_test.cpp /Fe:dist\voice_files_test.exe
+          if ($LASTEXITCODE -ne 0) { throw "Voice discovery regression test compilation failed: $LASTEXITCODE" }
+          & .\dist\voice_files_test.exe
+          if ($LASTEXITCODE -ne 0) { throw "Voice discovery regression tests failed: $LASTEXITCODE" }
+
+      - name: Test actual replacement and restore operations
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:NARAKA_MSVC /nologo /MT /EHsc /std:c++17 /utf-8 /W3 /I src tests\gui_operations_test.cpp src\akpk.cpp src\rebuild.cpp src\roles.cpp /Fe:dist\gui_operations_test.exe
+          if ($LASTEXITCODE -ne 0) { throw "GUI operation test compilation failed: $LASTEXITCODE" }
+          & .\dist\gui_operations_test.exe
+          if ($LASTEXITCODE -ne 0) { throw "GUI operation regression tests failed: $LASTEXITCODE" }
+
+      - name: Build and verify Windows x64 executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
           $sources = @('src\main.cpp', 'src\akpk.cpp', 'src\roles.cpp', 'src\rebuild.cpp', 'src\gui.cpp')
           $compileArgs = @('/nologo', '/O2', '/MT', '/EHsc', '/std:c++17', '/utf-8', '/W3', '/DUNICODE', '/D_UNICODE') + $sources + @('/Fe:dist\NarakaVoiceTool.exe')
-          & $compiler @compileArgs
+          & $env:NARAKA_MSVC @compileArgs
           if ($LASTEXITCODE -ne 0) { throw "MSVC compile failed with exit code $LASTEXITCODE" }
-
           $exe = Join-Path $PWD 'dist\NarakaVoiceTool.exe'
           if (-not (Test-Path $exe)) { throw 'Build output is missing.' }
           $bytes = [IO.File]::ReadAllBytes($exe)
@@ -64,10 +91,13 @@ jobs:
           $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
           if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length -or [Text.Encoding]::ASCII.GetString($bytes, $peOffset, 4) -ne "PE`0`0") { throw 'PE signature check failed.' }
           if ([BitConverter]::ToUInt16($bytes, $peOffset + 4) -ne 0x8664) { throw 'Expected an x64 Windows executable.' }
-
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
           [IO.File]::WriteAllText((Join-Path $PWD 'dist\NarakaVoiceTool.exe.sha256'), "$hash  NarakaVoiceTool.exe`n", [Text.Encoding]::ASCII)
           Write-Host "Verified x64 PE executable ($($bytes.Length) bytes); SHA-256 $hash"
+
+      - name: Launch release GUI and check split-package status
+        shell: pwsh
+        run: ./tests/windows_gui_smoke.ps1 -Exe ./dist/NarakaVoiceTool.exe
 
       - name: Publish GitHub Release
         shell: pwsh
@@ -82,15 +112,19 @@ jobs:
           } elseif ($env:GITHUB_REF_TYPE -eq 'tag') {
             $tag = $env:GITHUB_REF_NAME
           } else {
-            $tag = 'v0.1.0'
+            $tag = 'v0.1.1'
           }
           if ($tag -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "Invalid release tag: $tag" }
           if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw 'GitHub CLI is not installed on the runner.' }
           @'
           ## Windows x64 build
 
-          - `NarakaVoiceTool.exe`: MSVC 2022, x64, optimized, statically linked runtime.
+          - `NarakaVoiceTool.exe`: MSVC, x64, optimized, statically linked runtime.
           - `NarakaVoiceTool.exe.sha256`: SHA-256 checksum for the executable.
+          - Resolves legacy `ChineseCN.pck` and `ChineseCN_Common/Ingame/Outgame.pck` layouts.
+          - Language replacement is enabled only when matching source/target package shards are complete.
+          - Windows checks cover directory discovery, actual replacement/restore functions with generated AKPK data, backup preservation, role/system filtering, and launching the release GUI.
+          - In-game playback using the user's real voice assets is not verified by CI.
           - No game audio or other copyrighted game assets are included.
 
           Source attribution: [NarakaVoiceTool project](https://github.com/murongruolan/naraka-voice-switcher).

@@ -174,14 +174,16 @@ bool rebuild_pck(const std::wstring& cn_path, const std::wstring& jp_path,
 
     // 1) 头区: 原样 [0, data_start) —— bank 表 size 字段稍后回写
     std::vector<uint8_t> header;
-    cn.read(0, cn.data_start(), header);
+    if (!cn.read(0, cn.data_start(), header)) {
+        st.log.push_back("读取中文语音包头失败"); std::fclose(out); return false;
+    }
     // 动态定位表 (与 AkpkFile::open 相同逻辑):
     uint64_t ent_pos = 0; uint32_t cnt = 0;
     for (uint64_t c = 0x0C; c + 4 <= cn.data_start() && c < 0x400; c += 4) {
         uint64_t rem = cn.data_start() - c;
         if (rem == 0 || rem % 20) continue;
         uint32_t n = (uint32_t)(rem / 20);
-        if (n < 100 || n > 100000) continue;
+        if (n < 1 || n > 100000) continue; // match the small-bank support in AkpkFile
         std::vector<uint8_t> t4;
         if (!cn.read(c - 4, 4, t4)) continue;
         if (*(uint32_t*)t4.data() != n) continue;
@@ -206,6 +208,7 @@ bool rebuild_pck(const std::wstring& cn_path, const std::wstring& jp_path,
 
         std::vector<uint8_t> cn_raw;
         const bool cn_ok = cn.read(b.body_start, b.size, cn_raw);
+        if (!cn_ok) { st.log.push_back("读取中文语音 bank 失败"); std::fclose(out); return false; }
 
         // 角色过滤: only_banks 非空时仅替换命中 id (按角色部分替换)
         const bool want = only_banks.empty() ||
@@ -261,21 +264,27 @@ bool rebuild_pck(const std::wstring& cn_path, const std::wstring& jp_path,
     }
     if (progress) progress(0, total_est);
 
-    std::fwrite(header.data(), 1, header.size(), out);
+    bool write_ok = true;
+    auto write_bytes = [&](const void* data, size_t size) {
+        if (size && std::fwrite(data, 1, size, out) != size) write_ok = false;
+    };
+    write_bytes(header.data(), header.size());
     st.bytes_written += header.size();
     uint64_t accw = header.size();
     if (progress) progress(accw, total_est);
     for (auto& nb : bodies) {
         uint64_t pad = AkpkFile::align_up(accw, 4096) - accw;
         static const uint8_t zero[4096] = {0};
-        if (pad) { std::fwrite(zero, 1, pad, out); accw += pad; st.bytes_written += pad; }
-        std::fwrite(nb.bytes.data(), 1, nb.bytes.size(), out);
+        if (pad) { write_bytes(zero, static_cast<size_t>(pad)); accw += pad; st.bytes_written += pad; }
+        write_bytes(nb.bytes.data(), nb.bytes.size());
         accw += nb.bytes.size();
         st.bytes_written += nb.bytes.size();
         if (progress) progress(accw, total_est);
     }
-    std::fclose(out);
-    return true;
+    if (std::fflush(out) != 0) write_ok = false;
+    if (std::fclose(out) != 0) write_ok = false;
+    if (!write_ok) st.log.push_back("写入语音包失败，请检查磁盘空间和权限");
+    return write_ok;
 }
 
 } // namespace nvtool

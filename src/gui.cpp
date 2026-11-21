@@ -27,10 +27,12 @@
 #include "akpk.h"
 #include "rebuild.h"
 #include "roles.h"
+#include "voice_files.h"
 
 #include <atomic>
 #include <thread>
 #include <string>
+#include <utility>
 #include <vector>
 #include <set>
 #include <deque>
@@ -82,138 +84,63 @@ uint64_t file_size_of(const std::wstring& p) {
 std::wstring tool_dir() {
     wchar_t buf[MAX_PATH] = {0};
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    return fs::path(buf).parent_path().parent_path().wstring();
+    return fs::path(buf).parent_path().wstring();
 }
 bool copy_file_progress(const std::wstring& src, const std::wstring& dst,
                         const std::function<void(uint64_t, uint64_t)>& cb) {
+    // Write beside the destination, then rename: failures never truncate an original or its backup.
+    static std::atomic<unsigned> sequence{0};
+    const auto pending = dst + L".nvt-copy-" + std::to_wstring(GetCurrentProcessId()) +
+                         L"-" + std::to_wstring(sequence++);
     FILE* a = _wfopen(src.c_str(), L"rb");
     if (!a) return false;
-    FILE* b = _wfopen(dst.c_str(), L"wb");
+    FILE* b = _wfopen(pending.c_str(), L"wb");
     if (!b) { std::fclose(a); return false; }
     uint64_t total = file_size_of(src), done = 0;
+    bool ok = true;
     std::vector<char> buf(4 << 20);
     size_t n;
     while ((n = std::fread(buf.data(), 1, buf.size(), a)) > 0) {
-        if (std::fwrite(buf.data(), 1, n, b) != n) { std::fclose(a); std::fclose(b); return false; }
+        if (std::fwrite(buf.data(), 1, n, b) != n) { ok = false; break; }
         done += n;
         if (cb) cb(done, total ? total : 1);
     }
-    std::fclose(a); std::fclose(b);
-    return done == total;
+    if (std::ferror(a) || done != total || std::fflush(b) != 0) ok = false;
+    std::fclose(a);
+    if (std::fclose(b) != 0) ok = false;
+    if (ok) ok = MoveFileExW(pending.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    if (!ok) DeleteFileW(pending.c_str());
+    return ok;
 }
 
 // ---------- 定位 ----------
-const wchar_t* GAME_DATA_DIR = L"NarakaBladepoint_Data";
 const wchar_t* GAME_EXE_NAME = L"NarakaBladepoint.exe";
-const wchar_t* PCK_NAME = L"ChineseCN.pck";
 
-std::wstring game_windows_dir_from_data(const std::wstring& data_dir) {
-    std::wstring w = data_dir + L"\\StreamingAssets\\Audio\\GeneratedSoundBanks\\Windows";
-    return file_exists(w + L"\\" + PCK_NAME) ? w : L"";
-}
-std::wstring find_dir_down(const std::wstring& root, const wchar_t* name, int max_depth) {
-    std::deque<std::pair<std::wstring, int>> q;
-    q.push_back({root, 0});
-    while (!q.empty()) {
-        auto cur = q.front(); q.pop_front();
-        if (cur.second >= max_depth) continue;
-        WIN32_FIND_DATAW fd;
-        HANDLE h = FindFirstFileW((cur.first + L"\\*").c_str(), &fd);
-        if (h == INVALID_HANDLE_VALUE) continue;
-        do {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-                std::wstring sub = cur.first + L"\\" + fd.cFileName;
-                if (_wcsicmp(fd.cFileName, name) == 0) { FindClose(h); return sub; }
-                q.push_back({sub, cur.second + 1});
-            }
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-    }
-    return L"";
-}
-// 从 exe 所在目录(或任意目录)定位游戏的 GeneratedSoundBanks\Windows: 向下找 Data 目录, 失败则向上逐级
 std::wstring locate_game_windows(const std::wstring& base) {
-    // 向下找 NarakaBladepoint_Data (限深4)
-    std::wstring data = find_dir_down(base, GAME_DATA_DIR, 4);
-    if (!data.empty()) {
-        std::wstring w = game_windows_dir_from_data(data);
-        if (!w.empty()) return w;
-    }
-    // 向上逐级, 且每一级再做一次向下搜索 (处理 exe 在 tool\ 子目录、Data 在 program\ 的包装器布局)
-    fs::path p = base;
-    for (int i = 0; i < 6 && p.has_parent_path(); i++) {
-        p = p.parent_path();
-        std::wstring data2 = find_dir_down(p.wstring(), GAME_DATA_DIR, 3);
-        if (!data2.empty()) {
-            std::wstring w = game_windows_dir_from_data(data2);
-            if (!w.empty()) return w;
-        }
-        std::wstring cand = p.wstring() + L"\\" + GAME_DATA_DIR;
-        if (dir_exists(cand)) {
-            std::wstring w = game_windows_dir_from_data(cand);
-            if (!w.empty()) return w;
-        }
-    }
-    return L"";
+    return voice::locate_directory(fs::path(base)).wstring();
 }
 
-
-// 语言参考包: 任意 >100MB 的 .pck, 已知文件名挂中文标签
-struct LangRef { std::wstring path, file, label; };
+// Target packages must match every source shard (_Common/_Ingame/_Outgame) or use a legacy monolithic pair.
+struct LangRef { std::wstring path, file, label; std::vector<voice::Package> packages; };
 std::wstring label_for_pck(const std::wstring& file) {
-    if (_wcsicmp(file.c_str(), L"Japanese.pck") == 0) return L"日语";
-    if (_wcsicmp(file.c_str(), L"English.pck") == 0) return L"英语";
-    if (_wcsicmp(file.c_str(), L"Thai.pck") == 0) return L"泰语";
-    if (_wcsicmp(file.c_str(), L"ChineseCN.pck") == 0) return L"中文(原声)";
-    return L"";
+    std::wstring prefix;
+    voice::part_of(fs::path(file), prefix);
+    auto label = voice::language_name(prefix);
+    return label;
 }
-auto pck_big_enough = [](const std::wstring& p) { return file_exists(p) && file_size_of(p) > 100ull << 20; };
-
-// 在目录里收集全部语言参考包: 顶层 -> Audio\... 子路径 -> 递归限深5
 std::vector<LangRef> find_all_lang_pcks(const std::wstring& sel) {
     std::vector<LangRef> out;
-    auto add = [&](const std::wstring& full) {
-        std::wstring file = fs::path(full).filename().wstring();
-        for (auto& r : out) if (_wcsicmp(r.file.c_str(), file.c_str()) == 0) return;  // 按文件名去重
-        std::wstring lb = label_for_pck(file);
-        out.push_back({full, file, lb});
-    };
-    auto scan_dir = [&](const std::wstring& dir) {
-        WIN32_FIND_DATAW fd;
-        HANDLE h = FindFirstFileW((dir + L"\\*.pck").c_str(), &fd);
-        if (h == INVALID_HANDLE_VALUE) return;
-        do {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-            uint64_t sz = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-            if (sz > 100ull << 20) add(dir + L"\\" + fd.cFileName);
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
-    };
-    scan_dir(sel);
-    if (!out.empty()) return out;
-    scan_dir(sel + L"\\Audio\\GeneratedSoundBanks\\Windows");
-    if (!out.empty()) return out;
-    std::deque<std::pair<std::wstring, int>> q;
-    q.push_back({sel, 0});
-    while (!q.empty()) {
-        auto cur = q.front(); q.pop_front();
-        if (cur.second >= 5) continue;
-        WIN32_FIND_DATAW fd;
-        HANDLE h = FindFirstFileW((cur.first + L"\\*").c_str(), &fd);
-        if (h == INVALID_HANDLE_VALUE) continue;
-        do {
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                if (wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L".."))
-                    q.push_back({cur.first + L"\\" + fd.cFileName, cur.second + 1});
-            } else {
-                std::wstring f = fd.cFileName;
-                if (f.size() > 4 && _wcsicmp(f.c_str() + f.size() - 4, L".pck") == 0 &&
-                    (((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow) > 100ull << 20)
-                    add(cur.first + L"\\" + f);
-            }
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
+    for (auto language : voice::reference_languages(fs::path(sel))) {
+        if (!voice::complete(language.packages)) continue;
+        LangRef ref;
+        ref.label = language.name;
+        ref.packages = language.packages;
+        ref.path = ref.packages.front().path.wstring();
+        for (const auto& package : ref.packages) {
+            if (!ref.file.empty()) ref.file += L", ";
+            ref.file += package.path.filename().wstring();
+        }
+        out.push_back(std::move(ref));
     }
     return out;
 }
@@ -232,37 +159,54 @@ std::wstring g_langref_file;     // 用户选定的参考包文件名 (持久化
 std::wstring g_game_win;         // 解析出的 ...\GeneratedSoundBanks\Windows
 std::wstring g_jp_pck;           // 选定的参考 pck 全路径
 std::vector<LangRef> g_lang_refs;
+std::vector<voice::Package> g_chinese_packages;
 bool g_game_ok = false, g_jp_ok = false, g_bak_ok = false;
-std::string  g_state = "unknown";
+std::string g_state = "unknown";
 std::set<std::string> g_sel_roles;
 bool g_sel_sys = false;
-int  g_jp_roles = 0;
-int  g_tab = 0;                  // 0=全量替换 1=按角色替换
-
+int g_jp_roles = 0;
+int g_tab = 0;
 std::wstring g_op_msg, g_op_detail;
 bool g_op_ok = true;
-
-std::wstring pck_path() { return g_game_win + L"\\" + PCK_NAME; }
-std::wstring bak_path() { return g_game_win + L"\\" + PCK_NAME + L".bak"; }
+std::vector<voice::Pair> active_voice_pairs() {
+    if (g_chinese_packages.empty()) return {};
+    auto it = std::find_if(g_lang_refs.begin(), g_lang_refs.end(), [](const LangRef& language) {
+        return !g_jp_pck.empty() && _wcsicmp(language.path.c_str(), g_jp_pck.c_str()) == 0;
+    });
+    if (it == g_lang_refs.end()) return {};
+    voice::Language language{it->label, it->packages};
+    return voice::pair_packages(g_chinese_packages, language);
+}
+std::wstring bak_path(const std::wstring& pck) { return pck + L".bak"; }
+std::vector<voice::Pair> backup_voice_pairs() {
+    std::vector<voice::Pair> pairs;
+    for (const auto& package : g_chinese_packages)
+        pairs.push_back({package.path, fs::path(bak_path(package.path.wstring()))});
+    return pairs;
+}
 std::wstring tmp_out_path() { return fs::path(tool_dir()) / L"build\\gui_tmp_out.pck"; }
 std::wstring config_file() { return fs::path(tool_dir()) / L"gui_config.txt"; }
 std::wstring error_log_path() { return fs::path(tool_dir()) / L"gui_error.log"; }
-std::wstring marker_path() { return pck_path() + L".nvt"; }
-std::wstring marker_read() {
-    if (!file_exists(marker_path())) return L"";
-    FILE* f = _wfopen(marker_path().c_str(), L"rb");
+std::wstring marker_path(const std::wstring& pck) { return pck + L".nvt"; }
+std::wstring marker_read(const std::wstring& pck) {
+    auto path = marker_path(pck);
+    if (!file_exists(path)) return L"";
+    FILE* f = _wfopen(path.c_str(), L"rb");
     if (!f) return L"";
     char buf[128] = {0};
     size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
     std::fclose(f);
     return utf8_to_wide(std::string(buf, n));
 }
-void marker_write(const std::wstring& hash_hex) {
-    FILE* f = _wfopen(marker_path().c_str(), L"wb");
-    if (!f) return;
-    std::string s = wide_to_utf8(hash_hex);
-    std::fwrite(s.data(), 1, s.size(), f);
-    std::fclose(f);
+bool marker_write(const std::wstring& pck, const std::wstring& hash_hex) {
+    if (hash_hex.size() != 64) return false;
+    auto path = marker_path(pck);
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (!f) return false;
+    const std::string s = wide_to_utf8(hash_hex);
+    bool ok = std::fwrite(s.data(), 1, s.size(), f) == s.size();
+    if (std::fclose(f) != 0) ok = false;
+    return ok;
 }
 bool reg_read_string(HKEY root, const wchar_t* subkey, const wchar_t* value, std::wstring& out) {
     HKEY k;
@@ -406,8 +350,8 @@ void load_config() {
     std::string s(8192, 0);
     size_t n = std::fread(&s[0], 1, s.size(), f);
     std::fclose(f);
-            s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());   // 兼容 CRLF 配置
-        s.resize(n);
+    s.resize(n);
+    s.erase(std::remove(s.begin(), s.end(), '\r'), s.end());   // 兼容 CRLF 配置
     if (s.rfind("\xEF\xBB\xBF", 0) == 0) s.erase(0, 3);
     auto line_of = [&](size_t at) {
         size_t e = s.find('\n', at);
@@ -434,33 +378,27 @@ void load_config() {
 
 void resolve_all() {
     g_game_ok = g_jp_ok = g_bak_ok = false;
-    g_game_win.clear(); g_jp_pck.clear(); g_lang_refs.clear();
+    g_game_win.clear(); g_jp_pck.clear(); g_lang_refs.clear(); g_chinese_packages.clear();
     if (!g_sel_game.empty()) {
         std::wstring base = g_sel_game;
         std::wstring ext = fs::path(base).extension().wstring();
         if (_wcsicmp(ext.c_str(), L".exe") == 0) base = fs::path(base).parent_path().wstring();
         g_game_win = locate_game_windows(base);
-        g_game_ok = !g_game_win.empty();
+        if (!g_game_win.empty()) g_chinese_packages = voice::chinese_packages(fs::path(g_game_win));
+        g_game_ok = voice::complete(g_chinese_packages);
     }
-    g_bak_ok = g_game_ok && file_exists(bak_path());
-    if (!g_sel_jp.empty()) {
+    g_bak_ok = g_game_ok && std::all_of(g_chinese_packages.begin(), g_chinese_packages.end(), [](const voice::Package& p) {
+        return file_exists(bak_path(p.path.wstring()));
+    });
+    if (!g_sel_jp.empty() && g_game_ok) {
         g_lang_refs = find_all_lang_pcks(g_sel_jp);
-        {
-            FILE* df = _wfopen((fs::path(tool_dir()) / L"gui_debug.log").c_str(), L"ab");
-            if (df) {
-                std::string uj = wide_to_utf8(g_sel_jp);
-                std::fprintf(df, "[resolve] sel_len=%zu sel=%s refs=%zu\n", g_sel_jp.size(), uj.c_str(), g_lang_refs.size());
-                for (auto& r : g_lang_refs)
-                    std::fprintf(df, "[resolve]   ref: %s\n", wide_to_utf8(r.path).c_str());
-                std::fclose(df);
+        for (const auto& ref : g_lang_refs) {
+            if (_wcsicmp(ref.path.c_str(), g_langref_file.c_str()) == 0) {
+                g_jp_pck = ref.path; break;
             }
         }
-        for (auto& r : g_lang_refs)
-            if (!g_langref_file.empty() && _wcsicmp(r.file.c_str(), g_langref_file.c_str()) == 0) {
-                g_jp_pck = r.path; break;
-            }
         if (g_jp_pck.empty() && !g_lang_refs.empty()) g_jp_pck = g_lang_refs[0].path;
-        g_jp_ok = !g_jp_pck.empty();
+        g_jp_ok = !active_voice_pairs().empty();
     }
 }
 
@@ -474,34 +412,39 @@ bool tables_match(const std::wstring& a_path, const std::wstring& b_path) {
     }
     return true;
 }
+bool package_sets_match(const std::vector<voice::Pair>& pairs) {
+    if (pairs.empty()) return false;
+    for (const auto& pair : pairs)
+        if (!tables_match(pair.chinese.wstring(), pair.reference.wstring())) return false;
+    return true;
+}
 int count_jp_roles() {
-    if (!g_game_ok || !g_jp_ok) return 0;
-    AkpkFile a, b;
-    if (!a.open(pck_path()) || !b.open(g_jp_pck)) return 0;
-    int cnt = 0;
-    for (const auto& r : ROLE_TABLE) {
-        const BankEntry* pa = nullptr; const BankEntry* pb = nullptr;
-        for (int c = 0; c < 4 && !pa; c++) {
-            uint32_t id = fnv1_str(std::string(BANK_PREFIXES[c]) + r.en);
-            const BankEntry* x = a.find_bank(id);
-            const BankEntry* y = b.find_bank(id);
-            if (x && y && x->has_bkhd && y->has_bkhd && x->size == y->size) { pa = x; pb = y; }
+    auto pairs = active_voice_pairs();
+    std::set<std::string> changed_roles;
+    for (const auto& pair : pairs) {
+        AkpkFile chinese, reference;
+        if (!chinese.open(pair.chinese.wstring()) || !reference.open(pair.reference.wstring())) continue;
+        for (const auto& role : ROLE_TABLE) {
+            for (int category = 0; category < 4; ++category) {
+                uint32_t id = fnv1_str(std::string(BANK_PREFIXES[category]) + role.en);
+                const auto* a = chinese.find_bank(id);
+                const auto* b = reference.find_bank(id);
+                if (!a || !b || !a->has_bkhd || !b->has_bkhd || a->size != b->size || a->size < 20) continue;
+                std::vector<uint8_t> left, right;
+                if (chinese.read(a->body_start, a->size, left) && reference.read(b->body_start, b->size, right)) {
+                    left.erase(left.begin() + 16, left.begin() + 20);
+                    right.erase(right.begin() + 16, right.begin() + 20);
+                    if (left == right) { changed_roles.insert(role.en); break; }
+                }
+            }
         }
-        if (!pa) continue;
-        std::vector<uint8_t> vx, vy;
-        if (!a.read(pa->body_start, pa->size, vx) || !b.read(pb->body_start, pb->size, vy)) continue;
-        vx.erase(vx.begin() + 16, vx.begin() + 20);
-        vy.erase(vy.begin() + 16, vy.begin() + 20);
-        if (vx == vy) cnt++;
     }
-    return cnt;
+    return static_cast<int>(changed_roles.size());
 }
 void refresh_state() {
-    g_state = "unknown";
-    if (g_game_ok && file_exists(pck_path())) {
-        if (g_jp_ok && tables_match(pck_path(), g_jp_pck)) g_state = "jp";
-        else if (g_bak_ok && tables_match(pck_path(), bak_path())) g_state = "cn";
-    }
+    g_state = g_game_ok ? "cn" : "unknown";
+    for (const auto& package : g_chinese_packages)
+        if (file_exists(marker_path(package.path.wstring()))) g_state = "modified";
     g_jp_roles = count_jp_roles();
 }
 
@@ -523,109 +466,170 @@ bool game_running() {
 // ---------- 操作 ----------
 struct OpResult { bool ok; std::wstring msg; std::wstring detail; };
 
+bool readable_voice_pck(const std::wstring& path) {
+    AkpkFile file;
+    if (!file.open(path) || file.banks().empty() || file.data_start() > file.file_size()) return false;
+    std::set<uint32_t> ids;
+    for (const auto& bank : file.banks()) {
+        if (!ids.insert(bank.id).second || (bank.size && (bank.body_start > file.file_size() ||
+            bank.size > file.file_size() - bank.body_start))) return false;
+    }
+    return true;
+}
+
 OpResult op_apply(bool full_mode) {
-    std::wstring pck = pck_path(), bak = bak_path(), tmp = tmp_out_path();
-    if (!g_game_ok || !file_exists(pck)) return {false, L"游戏语音包未定位, 请完成第一步", L""};
-    if (!g_jp_ok || !file_exists(g_jp_pck)) return {false, L"语言包未定位, 请完成第一步", L""};
-
-    // 备份安全策略: .bak 只允许是官方中文, 绝不被我们的构建覆盖。
-    // 判定"当前文件是工具构建过的": 部署时写入指纹标记 (ChineseCN.pck.nvt = 部署哈希), 与现文件哈希一致即为自产
-    if (!full_mode) {
-        std::vector<uint32_t> role_ids_pre;
-        for (const auto& r : ROLE_TABLE) {
-            if (!g_sel_roles.count(r.en)) continue;
-            for (int c = 0; c < 4; c++) role_ids_pre.push_back(fnv1_str(std::string(BANK_PREFIXES[c]) + r.en));
-        }
-        if (role_ids_pre.empty() && !g_sel_sys)
-            return {false, L"请先勾选要替换的角色 (或切到「全量替换」)", L""};
+    auto pairs = active_voice_pairs();
+    if (!g_game_ok) return {false, L"未找到完整中文语音分包", L""};
+    if (!g_jp_ok || pairs.empty() || pairs.size() != g_chinese_packages.size())
+        return {false, L"未找到与中文语音一一对应的日语/英语包", L"三分包需匹配 _Common、_Ingame、_Outgame；旧版单包需匹配单包"};
+    for (const auto& pair : pairs) {
+        if (!readable_voice_pck(pair.chinese.wstring()) || !readable_voice_pck(pair.reference.wstring()))
+            return {false, L"已定位文件，但内部语音包格式不兼容，未修改游戏文件", pair.chinese.wstring() + L"\n" + pair.reference.wstring()};
     }
-    std::wstring cur_hash = utf8_to_wide(sha256_file(pck));
-    bool cur_is_ours = (!cur_hash.empty() && marker_read() == cur_hash);
-    if (!file_exists(bak)) {
-        if (cur_is_ours)
-            return {false, L"当前是工具生成的语言包且没有中文备份, 已中止。\n请先用 Steam「验证文件完整性」恢复中文文件, 再使用本工具",
-                    L"no backup, current=our build"};
-        g_phase = PH_BACKUP;
-        if (!copy_file_progress(pck, bak, [](uint64_t d, uint64_t t) {
-                g_pct = (int)(d * 50 / t); })) {
-            return {false, L"备份中文语音包失败 (磁盘空间/权限/被占用?)",
-                    std::wstring(L"backup copy failed:\n  src: ") + pck + L"\n  dst: " + bak};
-        }
-    } else if (!cur_is_ours) {
-        // 当前与上次部署不同 -> 视为官方中文 (可能已随游戏更新) -> 刷新备份
-        g_phase = PH_BACKUP;
-        if (!copy_file_progress(pck, bak, [](uint64_t d, uint64_t t) {
-                g_pct = (int)(d * 50 / t); })) {
-            return {false, L"备份中文语音包失败 (磁盘空间/权限/被占用?)",
-                    std::wstring(L"backup copy failed:\n  src: ") + pck + L"\n  dst: " + bak};
+    if (!full_mode && g_sel_roles.empty() && !g_sel_sys)
+        return {false, L"请先勾选要替换的角色 (或切到「全量替换」)", L""};
+
+    // Build all replacement files first; never mutate game files until every shard builds successfully.
+    std::error_code ec;
+    fs::create_directories(fs::path(tmp_out_path()).parent_path(), ec);
+    if (ec || !fs::is_directory(fs::path(tmp_out_path()).parent_path()))
+        return {false, L"无法创建临时工作目录", L"请检查工具目录的写入权限"};
+    for (size_t i = 0; i < pairs.size(); ++i) {
+        const auto source = pairs[i].chinese.wstring();
+        const auto backup = bak_path(source);
+        const auto current_hash = utf8_to_wide(sha256_file(source));
+        const bool current_is_ours = !current_hash.empty() && marker_read(source) == current_hash;
+        if (current_hash.empty()) return {false, L"无法校验中文语音文件", source};
+        if (!file_exists(backup) && current_is_ours)
+            return {false, L"工具修改后的语音包缺少原始备份，已停止以避免覆盖中文语音。", source};
+        if (file_exists(backup)) {
+            const auto backup_hash = utf8_to_wide(sha256_file(backup));
+            if (backup_hash.empty() || (!current_is_ours && backup_hash != current_hash))
+                return {false, L"原备份与当前文件不同，无法确认原声；已保留备份并停止", L"游戏更新或标记缺失时，请先验证游戏文件，再将旧 .bak 另存后重试。\n" + backup};
+        } else {
+            if (!copy_file_progress(source, backup, [i, total = pairs.size()](uint64_t done, uint64_t bytes) {
+                    g_pct = static_cast<int>(((static_cast<double>(i) +
+                        (bytes ? static_cast<double>(done) / bytes : 1.0)) * 30) / total);
+                }) || utf8_to_wide(sha256_file(backup)) != current_hash)
+                return {false, L"备份中文语音分包失败", L"src: " + source + L"\nbackup: " + backup};
         }
     }
-    g_bak_ok = file_exists(bak);
+    g_bak_ok = true;
 
-
-    // 阶段2: 生成目标语言包 (全量=替换所有 bank; 按角色=仅勾选 bank)
-    std::vector<uint32_t> only;
-    if (!full_mode) {
-        std::vector<uint32_t> role_ids;
-        for (const auto& r : ROLE_TABLE) {
-            if (!g_sel_roles.count(r.en)) continue;
-            for (int c = 0; c < 4; c++) role_ids.push_back(fnv1_str(std::string(BANK_PREFIXES[c]) + r.en));
-        }
-        if (role_ids.empty() && !g_sel_sys)
-            return {false, L"请先勾选要替换的角色 (或切到「全量替换」)", L""};
-        AkpkFile src;
-        if (src.open(bak)) {
-            std::set<uint32_t> rs(role_ids.begin(), role_ids.end());
-            for (const auto& cb2 : src.banks()) {
-                bool is_role_bank = rs.count(cb2.id) > 0;
-                if (is_role_bank || g_sel_sys) only.push_back(cb2.id);
+    struct Built { std::wstring source, output; };
+    int replaced_banks = 0;
+    std::vector<Built> built;
+    built.reserve(pairs.size());
+    for (size_t i = 0; i < pairs.size(); ++i) {
+        auto source = bak_path(pairs[i].chinese.wstring());
+        auto reference = pairs[i].reference.wstring();
+        std::vector<uint32_t> only;
+        if (!full_mode) {
+            std::vector<uint32_t> role_ids;
+            for (const auto& role : ROLE_TABLE) if (g_sel_roles.count(role.en))
+                for (int category = 0; category < 4; ++category)
+                    role_ids.push_back(fnv1_str(std::string(BANK_PREFIXES[category]) + role.en));
+            AkpkFile source_file;
+            if (source_file.open(source)) {
+                std::set<uint32_t> role_set(role_ids.begin(), role_ids.end()), all_roles;
+                for (const auto& role : ROLE_TABLE)
+                    for (int category = 0; category < 4; ++category)
+                        all_roles.insert(fnv1_str(std::string(BANK_PREFIXES[category]) + role.en));
+                for (const auto& bank : source_file.banks())
+                    if (role_set.count(bank.id) || (g_sel_sys && !all_roles.count(bank.id))) only.push_back(bank.id);
+            } else {
+                only = role_ids;
             }
-        } else only = role_ids;
+        }
+        auto output = (fs::path(tmp_out_path()).parent_path() /
+                       (L"voice_shard_" + std::to_wstring(i) + L".pck")).wstring();
+        DeleteFileW(output.c_str());
+        if (!full_mode && only.empty()) {
+            if (!copy_file_progress(source, output, [](uint64_t, uint64_t) {})) {
+                for (const auto& item : built) DeleteFileW(item.output.c_str());
+                return {false, L"无法保留未命中的语音分包", source};
+            }
+            built.push_back({pairs[i].chinese.wstring(), output});
+            continue;
+        }
+        RebuildStats stats;
+        if (!rebuild_pck(source, reference, output, stats, [i, total = pairs.size()](uint64_t done, uint64_t bytes) {
+                double fraction = bytes ? static_cast<double>(done) / bytes : 1.0;
+                g_pct = 30 + static_cast<int>(((i + fraction) * 50) / total);
+            }, only)) {
+            DeleteFileW(output.c_str());
+            for (const auto& item : built) DeleteFileW(item.output.c_str());
+            std::wstring details;
+            for (const auto& line : stats.log) details += utf8_to_wide(line) + L"\n";
+            return {false, L"生成分包失败: " + fs::path(pairs[i].chinese).filename().wstring(), details};
+        }
+        replaced_banks += stats.banks_replaced;
+        built.push_back({pairs[i].chinese.wstring(), output});
+    }
+    if (!replaced_banks) {
+        for (const auto& temp : built) DeleteFileW(temp.output.c_str());
+        return {false, L"目标语言包未命中可替换的语音 bank，游戏文件未修改", L"请使用同一游戏版本的语言资源"};
     }
 
-    g_phase = PH_BUILD;
-    if (file_exists(tmp)) DeleteFileW(tmp.c_str());
-    RebuildStats st;
-    if (!rebuild_pck(bak, g_jp_pck, tmp, st, [](uint64_t d, uint64_t t) {
-            g_pct = 50 + (int)(d * 40 / t); }, only)) {
-        std::wstring det;
-        for (auto& l : st.log) { det += utf8_to_wide(l); det += L"\n"; }
-        DeleteFileW(tmp.c_str());
-        return {false, L"生成语言包失败", L"rebuild_pck failed\n" + det};
+    for (const auto& item : built) {
+        if (!readable_voice_pck(item.output)) {
+            for (const auto& temp : built) DeleteFileW(temp.output.c_str());
+            return {false, L"生成分包未通过完整性校验，游戏文件未修改", item.source};
+        }
     }
-
-    g_phase = PH_DEPLOY;
-    if (!copy_file_progress(tmp, pck, [](uint64_t d, uint64_t t) {
-            g_pct = 90 + (int)(d * 10 / t); })) {
-        DeleteFileW(tmp.c_str());
-        return {false, L"写入游戏目录失败: 文件可能被占用, 请确认游戏已完全退出",
-                std::wstring(L"deploy copy failed:\n  src: ") + tmp + L"\n  dst: " + pck};
+    for (size_t i = 0; i < built.size(); ++i) {
+        const auto hash = utf8_to_wide(sha256_file(built[i].output));
+        g_phase = PH_DEPLOY;
+        if (hash.empty() || !copy_file_progress(built[i].output, built[i].source,
+                [i, total = built.size()](uint64_t done, uint64_t bytes) {
+                    double fraction = bytes ? static_cast<double>(done) / bytes : 1.0;
+                    g_pct = 80 + static_cast<int>(((i + fraction) * 20) / total);
+                }) || utf8_to_wide(sha256_file(built[i].source)) != hash || !marker_write(built[i].source, hash)) {
+            bool restored = true;
+            for (size_t j = 0; j <= i; ++j) {
+                const auto& item = built[j];
+                if (copy_file_progress(bak_path(item.source), item.source, [](uint64_t, uint64_t) {}))
+                    DeleteFileW(marker_path(item.source).c_str());
+                else restored = false;
+            }
+            for (const auto& item : built) DeleteFileW(item.output.c_str());
+            return {false, L"写入或标记语音分包失败" + std::wstring(restored ? L"，已回滚中文备份" : L"，回滚未完整，请使用 .bak 恢复"), built[i].source};
+        }
     }
-    marker_write(utf8_to_wide(sha256_file(tmp)));
-    DeleteFileW(tmp.c_str());
-    wchar_t b[128];
-    std::swprintf(b, 128, L"替换完成 (共 %d 个语音包)", st.banks_replaced);
-    return {true, b, L""};
+    for (const auto& item : built) DeleteFileW(item.output.c_str());
+    g_pct = 100;
+    return {true, L"语音替换完成 (已更新 " + std::to_wstring(built.size()) + L" 个分包)", L""};
 }
 
 OpResult op_restore() {
-    std::wstring pck = pck_path(), bak = bak_path();
-    if (!g_game_ok || !file_exists(pck)) return {false, L"游戏语音包未定位, 请完成第一步", L""};
-    if (!file_exists(bak)) return {false, L"找不到备份 ChineseCN.pck.bak, 无法恢复。\n可用 Steam「验证文件完整性」还原", L""};
-    bool is_jp = g_jp_ok && tables_match(pck, g_jp_pck);
-    bool is_bak_cn = tables_match(pck, bak);
-    if (!is_jp && !is_bak_cn && g_jp_roles <= 0)
-        return {true,
-                L"当前语音包已是中文原版，且与备份不同 —— 可能游戏刚更新过。\n无需恢复：直接点「开始替换」即可获得目标语言语音（备份也会自动刷新）。",
-                L""};
-    g_phase = PH_RESTORE;
-    if (!copy_file_progress(bak, pck, [](uint64_t d, uint64_t t) {
-            g_pct = (int)(d * 100 / t); })) {
-        return {false, L"恢复失败: 文件可能被占用, 请确认游戏已完全退出",
-                std::wstring(L"restore copy failed:\n  src: ") + bak + L"\n  dst: " + pck};
+    if (!g_game_ok || !g_bak_ok) return {false, L"找不到完整中文语音备份，无法恢复", L"请使用游戏平台验证文件完整性恢复"};
+    bool changed = false;
+    for (const auto& package : g_chinese_packages) {
+        const auto source = package.path.wstring();
+        const auto backup = bak_path(source);
+        if (!readable_voice_pck(backup)) return {false, L"中文语音备份缺失或损坏，未执行恢复", backup};
+        const auto current_hash = utf8_to_wide(sha256_file(source));
+        const auto backup_hash = utf8_to_wide(sha256_file(backup));
+        if (backup_hash.empty() || current_hash.empty()) return {false, L"无法校验当前语音或备份", source};
+        if (current_hash != backup_hash) {
+            if (marker_read(source) != current_hash)
+                return {false, L"当前语音与工具记录不同，可能游戏已更新；未覆盖游戏文件", source};
+            changed = true;
+        }
     }
-    DeleteFileW(marker_path().c_str());
-    return {true, L"已恢复原版中文语音", L""};
+    if (!changed) return {true, L"当前文件与中文备份一致，无需恢复", L""};
+    g_phase = PH_RESTORE;
+    for (size_t i = 0; i < g_chinese_packages.size(); ++i) {
+        auto source = g_chinese_packages[i].path.wstring();
+        auto backup = bak_path(source);
+        if (!copy_file_progress(backup, source, [i, total = g_chinese_packages.size()](uint64_t done, uint64_t bytes) {
+                double fraction = bytes ? static_cast<double>(done) / bytes : 1.0;
+                g_pct = static_cast<int>(((i + fraction) * 100) / total);
+            }))
+            return {false, L"恢复语音分包失败", source};
+        DeleteFileW(marker_path(source).c_str());
+    }
+    return {true, L"已恢复全部 " + std::to_wstring(g_chinese_packages.size()) + L" 个中文语音分包", L""};
 }
 
 void save_error_log(const std::wstring& msg, const std::wstring& detail) {
@@ -706,10 +710,11 @@ std::wstring ref_lang_name() {
 
 std::wstring cur_state_short() {
     std::wstring lang = g_jp_ok ? ref_lang_name() : L"目标语言";
-    if (g_state == "jp") return lang + L"配音(全部)";
-    if (g_jp_roles > 0) return L"部分替换 " + std::to_wstring(g_jp_roles) + L"/" +
+    if (!g_game_ok) return L"未识别";
+    if (g_jp_roles > 0) return L"已替换 " + std::to_wstring(g_jp_roles) + L"/" +
                                  std::to_wstring((int)ROLE_TABLE.size()) + L"(" + lang + L")";
-        return L"中文原版";
+    if (g_state == "modified") return L"已替换 (可恢复)";
+    return L"中文语音";
 }
 
 std::wstring phase_text() {
@@ -732,18 +737,22 @@ void refresh_texts() {
     if (g_sel_game.empty()) setv(IDC_ST_GAME, L"");
     else if (g_game_ok) {
         wchar_t b[96];
-        std::swprintf(b, 96, L"✔ 已定位语音包 %s (%.0f MB)", PCK_NAME, file_size_of(pck_path()) / 1048576.0);
+        double total_mb = 0;
+        for (const auto& package : g_chinese_packages) total_mb += file_size_of(package.path.wstring()) / 1048576.0;
+        std::swprintf(b, 96, L"✔ 已定位中文语音 (%zu 个文件, %.0f MB)", g_chinese_packages.size(), total_mb);
         setv(IDC_ST_GAME, b);
-    } else setv(IDC_ST_GAME, L"✘ 未找到语音包 —— 请确认选的是游戏 exe");
+    } else setv(IDC_ST_GAME, L"✘ 未找到完整中文语音包 —— 请确认所选游戏目录内含 ChineseCN.pck 或三个分包");
     if (g_sel_jp.empty()) setv(IDC_ST_JP, L"");
     else if (g_jp_ok) {
         std::wstring file = fs::path(g_jp_pck).filename().wstring();
-        std::wstring lb = label_for_pck(file);
+        auto language = std::find_if(g_lang_refs.begin(), g_lang_refs.end(), [](const LangRef& ref) {
+            return _wcsicmp(ref.path.c_str(), g_jp_pck.c_str()) == 0;
+        });
+        auto lb = language == g_lang_refs.end() ? label_for_pck(file) : language->label;
         wchar_t b[160];
-        if (!lb.empty()) std::swprintf(b, 160, L"✔ %s (%s · %.0f MB)", lb.c_str(), file.c_str(),
-                                       file_size_of(g_jp_pck) / 1048576.0);
-        else std::swprintf(b, 160, L"✔ 已定位 %s (%.0f MB)", file.c_str(),
-                           file_size_of(g_jp_pck) / 1048576.0);
+        if (!lb.empty()) std::swprintf(b, 160, L"✔ %s (%zu 个匹配分包)", lb.c_str(),
+                                       language == g_lang_refs.end() ? size_t(1) : language->packages.size());
+        else std::swprintf(b, 160, L"✔ 已定位 %s", file.c_str());
         setv(IDC_ST_JP, b);
     } else setv(IDC_ST_JP, L"✘ 没找到语言包 —— 请先解压官方语音包再选目录");
 
@@ -752,9 +761,9 @@ void refresh_texts() {
 
     bool can_base = !g_busy;
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_APPLY_FULL),
-                 can_base && g_game_ok && g_jp_ok && file_exists(pck_path()));
+                 can_base && g_game_ok && g_jp_ok && !active_voice_pairs().empty());
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_APPLY_ROLES),
-                 can_base && g_game_ok && g_jp_ok && file_exists(pck_path()) &&
+                 can_base && g_game_ok && g_jp_ok && !active_voice_pairs().empty() &&
                  (!g_sel_roles.empty() || g_sel_sys));
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_RESTORE), can_base && g_bak_ok);
     EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_GAME), !g_busy);
@@ -839,9 +848,7 @@ LRESULT CALLBACK pickproc(HWND h, UINT m, WPARAM w, LPARAM l) {
                                 WS_CHILD | WS_VISIBLE, 20, 14, 460, 20, h, nullptr, nullptr, nullptr);
         SendMessageW(st, WM_SETFONT, (WPARAM)g_f_lbl, TRUE);
         for (int i = 0; i < n; i++) {
-            std::wstring label = g_pick->cands[i].label.empty()
-                ? g_pick->cands[i].file
-                : g_pick->cands[i].label + L" — " + g_pick->cands[i].file;
+            std::wstring label = g_pick->cands[i].label + L" — " + g_pick->cands[i].file;
             HWND b = CreateWindowW(L"BUTTON", label.c_str(), WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
                                    20, 44 + i * 44, 460, 36, h, (HMENU)(INT_PTR)(2000 + i), nullptr, nullptr);
             SendMessageW(b, WM_SETFONT, (WPARAM)g_f_val, TRUE);
@@ -1182,11 +1189,12 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 of.lpstrFile = file;
                 of.nMaxFile = MAX_PATH;
                 of.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                std::wstring initial_dir;
                 if (!g_sel_game.empty()) {
                     fs::path initp(g_sel_game);
-                    std::wstring initd = fs::path(g_sel_game).extension().wstring() == L".exe"
+                    initial_dir = fs::path(g_sel_game).extension().wstring() == L".exe"
                         ? initp.parent_path().wstring() : g_sel_game;
-                    of.lpstrInitialDir = initd.c_str();
+                    of.lpstrInitialDir = initial_dir.c_str();
                 }
                 if (GetOpenFileNameW(&of)) {
                     g_sel_game = file;
@@ -1196,16 +1204,20 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     refresh_texts();
                 }
             } else if (id == IDC_BTN_JP) {
-                std::wstring sel = pick_folder(h, L"选择语言包目录 (内含 Japanese/English/Thai.pck 等)", g_sel_jp);
+                std::wstring sel = pick_folder(h, L"选择日语/英语参考包目录 (需单包或匹配的三分包)", g_sel_jp);
                 if (!sel.empty()) {
                     g_sel_jp = sel;
                     auto refs = find_all_lang_pcks(sel);
                     std::wstring chosen;
                     if (refs.size() == 1) chosen = refs[0].path;
                     else if (refs.size() >= 2) chosen = pick_lang_popup(h, refs);
+                    if (refs.empty()) {
+                        MessageBoxW(h, L"未找到与已识别中文语音文件一一对应的完整日语/英语分包。\n请确认目标目录包含 _Common、_Ingame、_Outgame 三个同语言 .pck 文件。",
+                                    L"语言包不匹配", MB_OK | MB_ICONINFORMATION);
+                    }
                     if (!chosen.empty()) {
                         g_jp_pck = chosen;
-                        g_langref_file = fs::path(chosen).filename().wstring();
+                        g_langref_file = chosen;
                         g_jp_ok = true;
                     }
                     save_config(); resolve_all(); refresh_state();
@@ -1296,7 +1308,7 @@ int run_gui() {
     g_f_val  = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, GB2312_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
     g_f_btn  = CreateFontW(-18, 0, 0, 0, FW_BOLD, 0, 0, 0, GB2312_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
     g_f_small = CreateFontW(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0, GB2312_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
-    g_f_msg  = CreateFontW(-13, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, GB2312_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
+    g_f_msg  = CreateFontW(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, GB2312_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
     g_f_tab  = CreateFontW(-14, 0, 0, 0, FW_BOLD, 0, 0, 0, GB2312_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
 
     WNDCLASSW wc{};

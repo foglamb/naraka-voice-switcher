@@ -32,6 +32,7 @@ bool AkpkFile::open(const std::wstring& p) {
     if (std::memcmp(head, "AKPK", 4) != 0) return false;
 
     data_start_ = *(uint32_t*)(head + 4);
+    if (data_start_ < sizeof(head) || data_start_ > file_size_) return false;
     // version @0x08 = 1 (不校验, 官方可能升版本)
 
     // 动态定位 bank 表 (语言字符串长度可变, 表位置不固定):
@@ -41,7 +42,7 @@ bool AkpkFile::open(const std::wstring& p) {
         uint64_t rem = data_start_ - c;
         if (rem == 0 || rem % 20) continue;
         uint32_t n = (uint32_t)(rem / 20);
-        if (n < 100 || n > 100000) continue;
+        if (n < 1 || n > 100000) continue; // split voice packages can contain fewer than 100 banks
         uint32_t cnt_field = 0;
         {
             std::vector<uint8_t> tmp;
@@ -50,7 +51,7 @@ bool AkpkFile::open(const std::wstring& p) {
         }
         if (cnt_field != n) continue;
         bool nz = true;
-        for (int k = 0; k < 3; k++) {
+        for (uint32_t k = 0; k < std::min(n, uint32_t(3)); k++) {
             std::vector<uint8_t> tmp;
             if (!read(c + (uint64_t)k * 20, 4, tmp) || *(uint32_t*)tmp.data() == 0) { nz = false; break; }
         }
@@ -72,6 +73,7 @@ bool AkpkFile::open(const std::wstring& p) {
         b.a   = *(uint32_t*)(e + 12);
         b.rsv = *(uint32_t*)(e + 16);
         b.body_start = align_up(acc, 4096);
+        if (b.size && (b.body_start > file_size_ || b.size > file_size_ - b.body_start)) return false;
         acc = b.body_start + b.size;
         // body 头探测, 两种格式 (CN/JP 实测各 277/233):
         //   A: "BKHD"        标准 Wwise bank 头
@@ -103,7 +105,9 @@ const BankEntry* AkpkFile::find_bank(uint32_t id) const {
 }
 
 bool AkpkFile::read(uint64_t pos, uint32_t size, std::vector<uint8_t>& out) const {
-    if (pos + size > file_size_) return false;
+    if (!f_) return false;
+    if (!size) { out.clear(); return true; }
+    if (pos > file_size_ || size > file_size_ - pos) return false;
     out.resize(size);
     _fseeki64(f_, (int64_t)pos, SEEK_SET);
     return std::fread(out.data(), 1, size, (FILE*)f_) == size;
