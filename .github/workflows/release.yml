@@ -1,0 +1,76 @@
+name: Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (for example v0.1.0)
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build and verify x64 executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+          $vswhere = Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) { throw "Visual Studio locator not found: $vswhere" }
+          $install = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $install) { throw 'Visual Studio C++ x64 toolchain not found.' }
+          $vcvars = Join-Path $install 'VC\Auxiliary\Build\vcvarsall.bat'
+          if (-not (Test-Path $vcvars)) { throw "MSVC environment script not found: $vcvars" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $sources = @('src\main.cpp', 'src\akpk.cpp', 'src\roles.cpp', 'src\rebuild.cpp', 'src\gui.cpp')
+          $compile = (@('cl', '/nologo', '/O2', '/MT', '/EHsc', '/std:c++17', '/utf-8', '/W3', '/DUNICODE', '/D_UNICODE') + $sources + @('/Fe:dist\NarakaVoiceTool.exe')) -join ' '
+          $command = 'call "' + $vcvars + '" -host_arch=x64 -arch=x64 >nul && ' + $compile
+          & $env:ComSpec /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw "MSVC compile failed with exit code $LASTEXITCODE" }
+
+          $exe = Join-Path $PWD 'dist\NarakaVoiceTool.exe'
+          if (-not (Test-Path $exe)) { throw 'Build output is missing.' }
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          if ($bytes.Length -lt 1024 -or $bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { throw 'Output is not a valid PE executable.' }
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length -or [Text.Encoding]::ASCII.GetString($bytes, $peOffset, 4) -ne "PE`0`0") { throw 'PE signature check failed.' }
+          if ([BitConverter]::ToUInt16($bytes, $peOffset + 4) -ne 0x8664) { throw 'Expected an x64 Windows executable.' }
+
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path $PWD 'dist\NarakaVoiceTool.exe.sha256'), "$hash  NarakaVoiceTool.exe`n", [Text.Encoding]::ASCII)
+          Write-Host "Verified x64 PE executable ($($bytes.Length) bytes); SHA-256 $hash"
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = if ($env:EVENT_NAME -eq 'workflow_dispatch') { $env:RELEASE_TAG } else { $env:GITHUB_REF_NAME }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') { throw "Invalid release tag: $tag" }
+          if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw 'GitHub CLI is not installed on the runner.' }
+          @'
+          ## Windows x64 build
+
+          - `NarakaVoiceTool.exe`: MSVC 2022, x64, optimized, statically linked runtime.
+          - `NarakaVoiceTool.exe.sha256`: SHA-256 checksum for the executable.
+          - No game audio or other copyrighted game assets are included.
+
+          Source attribution: [NarakaVoiceTool project](https://github.com/murongruolan/naraka-voice-switcher).
+          License: CC BY-NC 4.0; non-commercial use only. See the repository [LICENSE](https://github.com/foglamb/naraka-voice-switcher/blob/main/LICENSE).
+          '@ | Set-Content -Path dist\RELEASE_NOTES.md -Encoding utf8
+          gh release create $tag dist\NarakaVoiceTool.exe dist\NarakaVoiceTool.exe.sha256 --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "Naraka Voice Tool $tag" --notes-file dist\RELEASE_NOTES.md
+          if ($LASTEXITCODE -ne 0) { throw "Release creation/upload failed with exit code $LASTEXITCODE" }
